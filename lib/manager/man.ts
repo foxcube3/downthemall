@@ -54,6 +54,8 @@ export class Manager extends EventEmitter {
   private readonly manIds: Map<number, Download>;
 
   private readonly ports: Set<ManagerPort>;
+  // map native host download ids to Download instances
+  private readonly nativeIds: Map<string, Download>;
 
   private readonly running: Set<Download>;
 
@@ -83,6 +85,7 @@ export class Manager extends EventEmitter {
     this.sids = new Map();
     this.manIds = new Map();
     this.ports = new Set();
+  this.nativeIds = new Map();
     this.scheduler = null;
     this.running = new Set();
     this.retrying = new Set();
@@ -105,12 +108,45 @@ export class Manager extends EventEmitter {
       this.resetScheduler();
     });
 
-    if (CHROME) {
-      webRequest.onBeforeSendHeaders.addListener(
-        this.stuffReferrer.bind(this),
-        {urls: ["<all_urls>"]},
-        ["blocking", "requestHeaders", "extraHeaders"]
-      );
+    // In MV3 (Chromium) extensions are not allowed to use webRequestBlocking.
+    // Only register the blocking listener when running in environments that
+    // actually support it (older Chromium or Firefox). When running as an
+    // MV3 service worker in Chromium, header modification must be replaced
+    // by other approaches (declarativeNetRequest, native messaging, or
+    // moving fetches to privileged contexts).
+    if (CHROME && (webRequest as any).onBeforeSendHeaders &&
+        (webRequest as any).onBeforeSendHeaders.addListener) {
+      try {
+        webRequest.onBeforeSendHeaders.addListener(
+          this.stuffReferrer.bind(this),
+          { urls: ["<all_urls>"] },
+          ["blocking", "requestHeaders", "extraHeaders"]
+        );
+      }
+      catch (ex) {
+        // If registration fails (e.g. MV3 where blocking is disallowed),
+        // log and continue. The extension should fall back to a non-blocking
+        // strategy for header modification.
+        console.warn("Could not register blocking webRequest listener:", ex && ex.message || ex);
+      }
+    }
+  }
+
+  addNativeId(id: string, download: Download) {
+    try {
+      this.nativeIds.set(id, download);
+    }
+    catch (ex) {
+      // ignore
+    }
+  }
+
+  removeNativeId(id: string) {
+    try {
+      this.nativeIds.delete(id);
+    }
+    catch (ex) {
+      // ignore
     }
   }
 
@@ -363,15 +399,67 @@ export class Manager extends EventEmitter {
   }
 
   resumeDownloads(sids: number[], forced = false) {
-    this.forEach(sids, download => download.resume(forced));
+    this.forEach(sids, download => {
+      // If download uses native host, forward resume to native port
+      try {
+        const nativeId = (download as any).nativeId;
+        const port = (download as any).nativePort;
+        if (nativeId && port && port.postMessage) {
+          try {
+            port.postMessage({ type: 'download_resume', id: nativeId });
+          }
+          catch (e) {
+            // ignore
+          }
+        }
+      }
+      catch (ex) {
+        // ignore
+      }
+      download.resume(forced);
+    });
   }
 
   pauseDownloads(sids: number[]) {
-    this.forEach(sids, download => download.pause());
+    this.forEach(sids, download => {
+      try {
+        const nativeId = (download as any).nativeId;
+        const port = (download as any).nativePort;
+        if (nativeId && port && port.postMessage) {
+          try {
+            port.postMessage({ type: 'download_pause', id: nativeId });
+          }
+          catch (e) {
+            // ignore
+          }
+        }
+      }
+      catch (ex) {
+        // ignore
+      }
+      download.pause();
+    });
   }
 
   cancelDownloads(sids: number[]) {
-    this.forEach(sids, download => download.cancel());
+    this.forEach(sids, download => {
+      try {
+        const nativeId = (download as any).nativeId;
+        const port = (download as any).nativePort;
+        if (nativeId && port && port.postMessage) {
+          try {
+            port.postMessage({ type: 'download_cancel', id: nativeId });
+          }
+          catch (e) {
+            // ignore
+          }
+        }
+      }
+      catch (ex) {
+        // ignore
+      }
+      download.cancel();
+    });
   }
 
   setMissing(sid: number) {

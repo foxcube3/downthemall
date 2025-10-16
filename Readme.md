@@ -64,6 +64,10 @@ You have to build the bundles first, of course.
 
 Then put your Chrome into Developement Mode on the Extensions page, and Load Unpacked the directory of your downthemall clone.
 
+Native host (optional)
+----------------------
+If you plan to use the native helper (preroll and native interactive downloads), see `native/README.md` for instructions to install the native messaging host and a small installer script for Linux. During development you may need to register a user-level native messaging manifest that allows your extension id to connect.
+
 ### Making release zips
 
 To get a basic unofficial set of zips for Firefox and chrome, run `yarn build`.

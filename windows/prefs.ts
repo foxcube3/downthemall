@@ -82,6 +82,22 @@ class IntPref extends UIPref<HTMLInputElement> {
   }
 }
 
+class StringPref extends UIPref<HTMLInputElement> {
+  constructor(id: string, pref: string) {
+    super(id, pref);
+    this.elem.addEventListener("change", this.change.bind(this));
+  }
+
+  change() {
+    this.save(this.elem.value);
+  }
+
+  changed(prefs: any, key: string, value: any) {
+    this.elem.value = value || "";
+    return super.changed(prefs, key, value);
+  }
+}
+
 class OptionPref extends UIPref<HTMLElement> {
   options: HTMLInputElement[];
 
@@ -634,6 +650,56 @@ addEventListener("DOMContentLoaded", async () => {
   new IntPref("pref-concurrent-downloads", "concurrent");
   new IntPref("pref-retries", "retries");
   new IntPref("pref-retry-time", "retry-time");
+  new StringPref("pref-native-download-folder", "native-download-folder");
+  $("#pref-native-download-folder-default").addEventListener("click", async () => {
+    await Prefs.set("native-download-folder", "");
+  });
+
+  // Browse button - ask native host for a folder chooser when available
+  $("#pref-native-download-folder-browse").addEventListener("click", async () => {
+    try {
+      if ((runtime as any) && (runtime as any).sendNativeMessage) {
+        const cur = await Prefs.get('native-download-folder');
+        const res = await (runtime as any).sendNativeMessage("downthemall.native", {type: 'choose_folder', default: cur || undefined});
+        if (!res) {
+          return;
+        }
+        if (res.ok && res.path) {
+          // validate path via native stat_path
+          try {
+            const stat = await (runtime as any).sendNativeMessage("downthemall.native", {type: 'stat_path', path: res.path});
+            if (stat && stat.ok) {
+              await Prefs.set('native-download-folder', stat.path);
+              return;
+            }
+            // show error and offer to create parent or use fallback
+            const msg = `Selected path not writable: ${stat && stat.error ? stat.error : 'unknown'}`;
+            const useFallback = stat && stat.fallback ? confirm(`${msg}\nUse suggested path ${stat.fallback}?`) : false;
+            if (useFallback) {
+              await Prefs.set('native-download-folder', stat.fallback);
+            }
+          }
+          catch (ex2) {
+            console.error('stat_path failed', ex2);
+            // fallback to saving the raw path
+            await Prefs.set('native-download-folder', res.path);
+          }
+          return;
+        }
+        if (!res.ok && res.fallback) {
+          // Offer fallback path (home) to user
+          const useFallback = confirm(`Could not open native chooser: ${res.error || 'unknown'}\nUse suggested path ${res.fallback}?`);
+          if (useFallback) {
+            await Prefs.set('native-download-folder', res.fallback);
+          }
+        }
+      }
+    }
+    catch (ex) {
+      console.error('native choose_folder failed', ex);
+      alert('Could not open native folder chooser. Is the native host installed?');
+    }
+  });
 
   visible("#limits").then(() => new LimitsUI());
 

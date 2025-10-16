@@ -4,7 +4,7 @@
 import MimeType from "whatwg-mimetype";
 // eslint-disable-next-line no-unused-vars
 import { Download } from "./download";
-import { CHROME, webRequest } from "../browser";
+import { CHROME, webRequest, runtime } from "../browser";
 import { CDHeaderParser } from "../cdheaderparser";
 import { sanitizePath, parsePath } from "../util";
 import { MimeDB } from "../mime";
@@ -112,9 +112,38 @@ export class Preroller {
   }
 
   private async prerollChrome() {
-    let rid = "";
+    // Prefer native messaging helper to retrieve headers when available.
     const {uURL, uReferrer} = this.download;
     const rurl = uURL.toString();
+
+    if ((runtime as any) && (runtime as any).sendNativeMessage) {
+      try {
+        const msg = {
+          type: "preroll",
+          url: rurl,
+          referrer: (uReferrer || uURL).toString(),
+          range: "bytes=0-1"
+        };
+        // webextension polyfill returns a Promise for sendNativeMessage
+        const nativeRes: any = await (runtime as any).sendNativeMessage("downthemall.native", msg);
+        if (nativeRes && nativeRes.ok) {
+          const headers = new Headers(nativeRes.headers || []);
+          // Build a minimal Response-like object with redirected/finalUrl/status
+          const fakeRes: any = { url: nativeRes.finalUrl || rurl, redirected: false, status: nativeRes.status || 200, body: null };
+          return this.finalize(headers, fakeRes as Response);
+        }
+        else {
+          throw new Error(nativeRes && nativeRes.error ? nativeRes.error : "native error");
+        }
+      }
+      catch (ex) {
+        console.warn("Native preroll failed, falling back to in-extension fetch:", ex && ex.message || ex);
+        // fall through to the legacy approach
+      }
+    }
+
+    // Legacy approach: observe headers via webRequest and fetch (may not work under MV3)
+    let rid = "";
     let listener: any;
     const wr = new Promise<any[]>(resolve => {
       listener = (details: any) => {
@@ -130,8 +159,14 @@ export class Preroller {
         }
         resolve(details.responseHeaders);
       };
-      webRequest.onHeadersReceived.addListener(
-        listener, {urls: ["<all_urls>"]}, ["responseHeaders"]);
+      try {
+        webRequest.onHeadersReceived.addListener(
+          listener, { urls: ["<all_urls>"] }, ["responseHeaders"]);
+      }
+      catch (ex) {
+        // If we cannot register a listener (MV3), rethrow so caller handles it
+        throw ex;
+      }
     });
     const p = Promise.race([
       wr,
@@ -140,7 +175,12 @@ export class Preroller {
     ]);
 
     p.finally(() => {
-      webRequest.onHeadersReceived.removeListener(listener);
+      try {
+        webRequest.onHeadersReceived.removeListener(listener);
+      }
+      catch (e) {
+        // ignore
+      }
     });
     const controller = new AbortController();
     const {signal} = controller;
@@ -159,7 +199,7 @@ export class Preroller {
     controller.abort();
     const headers = await p;
     return this.finalize(
-      new Headers(headers.map(i => [i.name, i.value])), res);
+      new Headers(headers.map((i: any) => [i.name, i.value])), res);
   }
 
   private finalize(headers: Headers, res: Response): PrerollResults {

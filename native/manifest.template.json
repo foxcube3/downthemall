@@ -1,0 +1,9 @@
+{
+  "name": "downthemall.native",
+  "description": "DownThemAll! native messaging host (preroll and interactive downloads)",
+  "path": "__ABSOLUTE_PATH_TO_NATIVE_HOST__",
+  "type": "stdio",
+  "allowed_origins": [
+    "__EXTENSION_ID__"
+  ]
+}

@@ -101,6 +101,7 @@ export interface OnInstalled {
 }
 
 export const {browserAction} = polyfill;
+export const {action} = polyfill;
 export const {contextMenus} = polyfill;
 export const {downloads}: {downloads: Downloads} = polyfill;
 export const {extension} = polyfill;

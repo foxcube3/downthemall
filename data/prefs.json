@@ -15,6 +15,7 @@
 	"tooltip": true,
 	"show-urls": false,
 	"remove-missing-on-init": false,
+	"native-download-folder": "",
 	"retries": 5,
 	"retry-time": 10,
 	"theme": "default",

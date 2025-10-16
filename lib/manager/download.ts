@@ -2,7 +2,7 @@
 // License: MIT
 
 // eslint-disable-next-line no-unused-vars
-import { CHROME, downloads, DownloadOptions } from "../browser";
+import { CHROME, downloads, DownloadOptions, runtime } from "../browser";
 import { Prefs, PrefWatcher } from "../prefs";
 import { PromiseSerializer } from "../pserializer";
 import { filterInSitu, parsePath } from "../util";
@@ -42,6 +42,12 @@ export class Download extends BaseDownload {
   public manager: Manager;
 
   public manId: number;
+
+  // If this download is handled by the native host, we store the
+  // long-lived port and the native download id here so we can
+  // send pause/resume/cancel control messages.
+  public nativePort: any | null = null;
+  public nativeDid: string | null = null;
 
   public removed: boolean;
 
@@ -172,13 +178,175 @@ export class Download extends BaseDownload {
         }
         // Re-attempt without referrer
         filterInSitu(options.headers, h => h.name !== "Referer");
-        this.manager.addManId(
-          this.manId = await downloads.download(options), this);
+        try {
+          this.manager.addManId(
+            this.manId = await downloads.download(options), this);
+        }
+        catch (ex2) {
+          // If we're on Chrome and native messaging is available, try native host
+          if (CHROME && (runtime as any) && (runtime as any).sendNativeMessage) {
+            try {
+                // Use a long-lived native port to receive progress events
+                const port = (runtime as any).connectNative("downthemall.native");
+                const msg: any = {
+                  type: "download_start",
+                  url: this.url,
+                  referrer: this.referrer,
+                  headers: options.headers,
+                  method: options.method,
+                  body: options.body,
+                  filename: this.dest ? this.dest.full : undefined
+                };
+                // remember native port so we can control the download
+                this.nativePort = port;
+                port.postMessage(msg);
+
+                const onMessage = (m: any) => {
+                  if (!m) {
+                    return;
+                  }
+
+                  // initial ok with id
+                  if (m.ok && m.id) {
+                    this.nativeDid = m.id;
+                  }
+
+                  // progress updates
+                  if (m.type === 'progress') {
+                    this.written = m.downloaded || this.written;
+                    this.totalSize = m.total || this.totalSize;
+                    this.browserName = m.path || this.browserName;
+                    this.markDirty();
+                    return;
+                  }
+
+                  // paused/cancelled events from native host
+                  if (m.type === 'paused') {
+                    this.written = m.downloaded || this.written;
+                    this.changeState(PAUSED);
+                    this.markDirty();
+                    return;
+                  }
+                  if (m.type === 'cancelled') {
+                      this.error = 'cancelled';
+                      this.reset();
+                      this.changeState(CANCELED);
+                      this.markDirty();
+                      try { this.cleanupNative(); } catch (e) { }
+                    return;
+                  }
+
+                  // download finished; ask native host to move temp file to final path
+                  if (m.type === 'done') {
+                    const nativePath = m.path;
+                    // Determine final destination: use configured pref if available, else use this.dest.full if it's an absolute path
+                    (async () => {
+                      try {
+                        const cfg = await Prefs.get('native-download-folder', '') as string;
+                        let finalPath = nativePath;
+                        const filename = (this.dest && this.dest.full) ? this.dest.full.split(/[/\\]+/).pop() : nativePath.split('/').pop();
+                        if (cfg && cfg.length) {
+                          // ensure trailing slash handling
+                          const sep = cfg.endsWith('/') ? '' : '/';
+                          finalPath = `${cfg}${sep}${filename}`;
+                        }
+                        else if (this.dest && this.dest.full && this.dest.full.includes('/')) {
+                          finalPath = this.dest.full;
+                        }
+                        const moveReq = { type: 'move', src: nativePath, dst: finalPath };
+                        try {
+                          port.postMessage(moveReq);
+                        }
+                        catch (e) {
+                          console.warn('failed to post move request', e);
+                          // fallback: mark done with native path
+                          this.browserName = nativePath;
+                          this.written = this.totalSize = m.size || this.written || this.totalSize;
+                          this.changeState(DONE);
+                          this.markDirty();
+                          try { this.cleanupNative(); } catch (err) { }
+                        }
+                      }
+                      catch (ex) {
+                        console.warn('failed to determine final path', ex && ex.message || ex);
+                        this.browserName = nativePath;
+                        this.written = this.totalSize = m.size || this.written || this.totalSize;
+                        this.changeState(DONE);
+                        this.markDirty();
+                        try { this.cleanupNative(); } catch (err) { }
+                      }
+                    })();
+                    return;
+                  }
+
+                  // move or other ok responses
+                  if (m.ok && m.path) {
+                    const movedPath = m.path;
+                    (async () => {
+                      try {
+                        const fileUrl = `file://${movedPath}`;
+                        const downloadOpts: DownloadOptions = {
+                          url: fileUrl,
+                          saveAs: false,
+                          conflictAction: this.conflictAction || 'uniquify',
+                          headers: [],
+                          filename: (this.dest && this.dest.full) || undefined
+                        };
+                        const id = await downloads.download(downloadOpts) as number;
+                        const manId = typeof id === 'number' ? id : 0;
+                        if (manId) {
+                          this.manager.addManId(manId, this);
+                          this.manId = manId;
+                          this.browserName = (this.dest && this.dest.full) || movedPath;
+                          this.written = this.totalSize = m.size || this.written || this.totalSize;
+                          this.changeState(DONE);
+                          this.markDirty();
+                          try { this.cleanupNative(); } catch (e) { }
+                          try { this.cleanupNative(); } catch (err) { }
+                          return;
+                        }
+                      }
+                      catch (err) {
+                        console.warn('Registering moved file in downloads failed', err && err.message || err);
+                      }
+                      // fallback
+                      this.browserName = movedPath;
+                      this.written = this.totalSize = m.size || this.written || this.totalSize;
+                      this.changeState(DONE);
+                      this.markDirty();
+                      try { this.cleanupNative(); } catch (e) { }
+                      try { this.cleanupNative(); } catch (e) { }
+                    })();
+                    return;
+                  }
+
+                  if (m.type === 'error') {
+                    console.error('native download error', m.error);
+                    try { this.cleanupNative(); } catch (e) { }
+                    return;
+                  }
+                };
+                try {
+                  port.onMessage.addListener(onMessage);
+                }
+                catch (e) {
+                  console.warn('native port message listener failed', e);
+                }
+                return;
+              }
+            catch (nex) {
+              console.error("native download failed", nex);
+              throw ex2;
+            }
+          }
+          throw ex2;
+        }
       }
       this.markDirty();
     }
     catch (ex) {
       console.error("failed to start download", ex.toString(), ex);
+      try { this.cleanupNative(); } catch (e) { }
       this.changeState(CANCELED);
       this.error = ex.toString();
     }
@@ -233,6 +401,15 @@ export class Download extends BaseDownload {
     if (forced) {
       this.manager.startDownload(this);
     }
+    // If this was a native-managed download and was paused, request native resume
+    if (this.nativePort && this.nativeDid) {
+      try {
+        this.nativePort.postMessage({type: 'download_resume', id: this.nativeDid});
+      }
+      catch (ex) {
+        console.error('native resume failed', ex);
+      }
+    }
   }
 
   async pause(retry?: boolean) {
@@ -270,6 +447,26 @@ export class Download extends BaseDownload {
     this.mime = this.serverName = this.browserName = "";
     this.retries = 0;
     this.deadline = 0;
+    // ensure native resources are cleaned up
+    try {
+      this.cleanupNative();
+    }
+    catch (e) {
+      // ignore
+    }
+  }
+
+  // Disconnect and clear any native port/id associated with this download
+  private cleanupNative() {
+    try {
+      if (this.nativePort && typeof this.nativePort.disconnect === 'function') {
+        try { this.nativePort.disconnect(); } catch (e) { }
+      }
+    }
+    finally {
+      this.nativePort = null;
+      this.nativeDid = null;
+    }
   }
 
   async removeFromBrowser() {
@@ -293,6 +490,15 @@ export class Download extends BaseDownload {
   cancel() {
     if (!(CANCELABLE & this.state)) {
       return;
+    }
+    // If native-managed, inform native host to cancel
+    if (this.nativePort && this.nativeDid) {
+      try {
+        this.nativePort.postMessage({type: 'download_cancel', id: this.nativeDid});
+      }
+      catch (ex) {
+        console.error('native cancel failed', ex);
+      }
     }
     if (this.manId) {
       this.manager.removeManId(this.manId);

@@ -1,0 +1,9 @@
+{
+  "name": "downthemall.native",
+  "description": "DownThemAll native messaging host (preroll helper)",
+  "path": "/usr/local/bin/downthemall-native-host",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://<<EXTENSION_ID>>/"
+  ]
+}
